@@ -1160,7 +1160,7 @@ def main():
     use_tws = not args.no_tws and setting("USE_TWS", "1").lower() not in ("0", "false", "no")
     tws = None
     if use_tws:
-        tws = fetch_tws(setting("TWS_HOST", "127.0.0.1"), int(setting_num("TWS_PORT", 7496)),
+        tws = fetch_tws(setting("TWS_HOST", "127.0.0.1"), int(setting_num("TWS_PORT", 4001)),
                         int(setting_num("TWS_CLIENT_ID", 997)), setting_num("TWS_WAIT_SECONDS", 8))
     cache = update_order_cache(tws, ORDER_CACHE)
 

@@ -55,9 +55,9 @@ MAX_POLL_ATTEMPTS = 12   # GetStatement retries
 POLL_WAIT_SECONDS = 5    # wait between retries while statement is generating
 
 # TWS live connection (for Pending Orders)
-HOST       = "127.0.0.1"
-PORT       = 7496        # 7496 live TWS | 7497 paper | 4001/4002 Gateway
-CLIENT_ID  = 998
+HOST       = os.environ.get("TWS_HOST", "127.0.0.1")
+PORT       = int(os.environ.get("TWS_PORT", "4001"))       # 4001 live Gateway | 4002 paper Gateway | 7496 live TWS | 7497 paper TWS
+CLIENT_ID  = int(os.environ.get("TWS_CLIENT_ID", "998"))
 ORDER_WAIT = 6           # seconds to wait for open-order callbacks
 
 _UNSET = (0, 1.7976931348623157e308)  # IBKR "no value" sentinels
