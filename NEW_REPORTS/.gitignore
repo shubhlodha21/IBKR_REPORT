@@ -1,0 +1,4 @@
+# Generated reports and raw Flex XML (contain account details)
+reports/
+# TWS order cache (trigger / limit / status history)
+data/

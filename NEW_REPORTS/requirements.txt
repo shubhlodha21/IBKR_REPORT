@@ -1,0 +1,4 @@
+requests==2.32.3
+openpyxl==3.1.5
+tzdata
+ibapi==9.81.1.post1
