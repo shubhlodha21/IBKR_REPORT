@@ -1,5 +1,7 @@
-# run.ps1 - Windows PowerShell launcher. Extra arguments are passed to the script, e.g.
-#   .\run.ps1 --daily
+# run.ps1 - Windows PowerShell launcher. Always writes both outputs:
+#   reports\GT_Report_<from>_to_<to>.xlsx   full history (+ live TWS data)
+#   reports\daily\GT_Report_<day>.xlsx      one workbook per trading day
+# Extra arguments are passed to the script, e.g.
 #   .\run.ps1 --from 2026-10-01 --to 2026-10-31 --no-tws
 
 $ErrorActionPreference = "Stop"
@@ -24,4 +26,4 @@ python -m pip install --upgrade pip --quiet
 python -m pip install -r requirements.txt --quiet
 
 Write-Host "Running $Script..."
-python $Script @args
+python $Script --daily @args

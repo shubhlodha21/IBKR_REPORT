@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
-# run.sh - Linux / EC2 launcher. Extra arguments are passed to the script, e.g.
-#   bash run.sh --daily
+# run.sh - Linux / EC2 launcher. Always writes both outputs:
+#   reports/GT_Report_<from>_to_<to>.xlsx   full history (+ live TWS data)
+#   reports/daily/GT_Report_<day>.xlsx      one workbook per trading day
+# Extra arguments are passed to the script, e.g.
 #   bash run.sh --from 2026-10-01 --to 2026-10-31
+#   bash run.sh --no-tws
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -28,4 +31,4 @@ pip install --upgrade pip --quiet
 pip install -r requirements.txt --quiet
 
 echo "Running $SCRIPT..."
-python "$SCRIPT" "$@"
+python "$SCRIPT" --daily "$@"
