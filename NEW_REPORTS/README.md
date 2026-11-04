@@ -41,6 +41,12 @@ Reports go to `reports/`; the raw Flex XML is kept in `reports/raw/`.
   `executed (TWS live, not yet in Flex)`. The next day Flex has them and they are replaced by the Flex
   figures (matched by execution id, so nothing is counted twice). Gateway forgets executions after its
   daily restart, so they are also kept in `data/tws_executions_cache.json` until Flex has them.
+- SL % = |entry price - stop trigger| / entry price. The stop is found by its bracket tag even while it is
+  still pending; when Flex has no order price for an older entry, its average fill price is used.
+- Metals are booked in IBKR's `...F` sub-account in Flex but under the main account in TWS; both are
+  treated as one account when matching orders and positions (the Account column shows the real one).
+- Each default run replaces the previous full-history report (the name carries the end date); reports
+  made with `--from` / `--to` are kept. `fetch_ec2_reports.bat` mirrors that on the PC.
 - Gateway execution times are read in the time zone from `~/Jts/jts.ini` (`TimeZone=`), or `TWS_TIMEZONE` in `.env`.
 - The Flex query covers the last 365 days. Use `--from` for anything older; the script downloads it in 365-day chunks.
 - Flex has no order prices, so trigger, limit, offset and SL % come from TWS. TWS only remembers recent

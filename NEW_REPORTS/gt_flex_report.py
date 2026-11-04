@@ -49,6 +49,7 @@ DEFAULT_OUT = SCRIPT_DIR / "reports"
 ORDER_CACHE = SCRIPT_DIR / "data" / "tws_orders_cache.json"
 EXEC_CACHE = SCRIPT_DIR / "data" / "tws_executions_cache.json"
 EXEC_CACHE_KEEP_DAYS = 10      # executions older than Flex data minus this are dropped from the cache
+LAST_TOTAL = SCRIPT_DIR / "data" / "last_total_report.txt"   # previous full-history report (replaced each run)
 
 FLEX_SEND_URL = "https://ndcdyn.interactivebrokers.com/AccountManagement/FlexWebService/SendRequest"
 FLEX_GET_URL = "https://ndcdyn.interactivebrokers.com/AccountManagement/FlexWebService/GetStatement"
@@ -214,12 +215,22 @@ def to_gst(dt):
     return dt.astimezone(TZ_GST).replace(tzinfo=None) if dt else None
 
 
+def canon(account):
+    """IBKR books metals / commodities in an 'F' sub-account (U1234567F) in Flex, while TWS reports
+    the same trades and positions under the main account (U1234567). Use the main account
+    whenever orders and positions are matched; the real account is still shown in the sheets."""
+    account = (account or "").strip()
+    if len(account) > 2 and account[-1] in "Ff" and account[-2].isdigit():
+        return account[:-1]
+    return account
+
+
 def ref_key(account, conid, order_ref):
     """(group key, is_entry) from the algo's orderRef, or (None, False)."""
     m = REF_RE.match((order_ref or "").strip())
     if not m:
         return None, False
-    return ("ref", account, conid, m.group("key").lower()), m.group("role").upper() == "ENTRY"
+    return ("ref", canon(account), conid, m.group("key").lower()), m.group("role").upper() == "ENTRY"
 
 
 # --------------------------------------------------------------------------- #
@@ -317,6 +328,7 @@ class Fill:
     txn_id: str
     auto_fx: bool             # IBKR automatic conversion of a leftover cash balance
     source: str = "FLEX"      # FLEX, or TWS for live fills Flex has not reported yet
+    exec_id: str = ""         # IBKR execution id (Flex ibExecID / TWS execId)
     pnl_ccy: str = ""         # currency of fifo_pnl when it is not the trade currency (TWS fills)
     value: float = 0.0        # base currency
     commission: float = 0.0   # base currency (negative = paid)
@@ -394,7 +406,7 @@ class FlexData:
             if (a.get("levelOfDetail") or "SUMMARY").upper() != "SUMMARY":
                 continue
             rd = parse_date(a.get("reportDate")) or date.min
-            key = (acct, a.get("conid", ""))
+            key = (canon(acct), a.get("conid", ""))
             value = num(a.get("fifoPnlUnrealized")) * (num(a.get("fxRateToBase")) or 1.0)
             if key not in self.flex_unrealized or rd >= self.flex_unrealized[key][0]:
                 self.flex_unrealized[key] = (rd, value)
@@ -441,6 +453,7 @@ class FlexData:
             order_ref=a.get("orderReference", "") or "",
             txn_id=a.get("transactionID") or a.get("tradeID") or "",
             auto_fx=asset == "CASH" and not a.get("orderType"),
+            exec_id=(a.get("ibExecID") or "").strip(),
         )
 
     def _finalize(self):
@@ -483,7 +496,7 @@ class FlexData:
         for f in self.fills:
             if f.auto_fx:
                 continue
-            key = (f.account, f.conid)
+            key = (canon(f.account), f.conid)
             if abs(net[key]) < 1e-9:
                 cycle_no[key] += 1
             f.cycle = cycle_no[key]
@@ -498,11 +511,28 @@ class FlexData:
         added = []
         flex_last = self.to_date
         flex_last_dt = self.fills[-1].dt if self.fills else None
-        for exec_id, x in executions.items():
-            if exec_id in self.flex_exec_ids:
+        # Second guard, in case an execution id ever differs between TWS and Flex: a Flex fill not
+        # matched by id, with the same main account, contract, side, quantity and price within
+        # 2 minutes, is the same fill. Matched one-to-one, so genuine identical fills
+        # (e.g. one order split across two exchanges in the same second) are all kept.
+        tws_ids = {k.strip() for k in executions}
+        flex_sig = defaultdict(list)
+        for f in self.fills:
+            if f.source == "FLEX" and f.exec_id not in tws_ids:
+                flex_sig[(canon(f.account), f.conid, f.side, round(f.qty, 6), round(f.price, 6))].append(f.dt)
+        for exec_id, x in sorted(executions.items(), key=lambda kv: kv[1].get("time", "")):
+            if exec_id.strip() in self.flex_exec_ids:
                 continue
             dt = parse_tws_time(x.get("time", ""), tws_tz)
             if dt is None:
+                continue
+            side = "SELL" if x.get("side", "").upper() in ("SLD", "SELL") else "BUY"
+            sig = (canon(x.get("account", "")), x.get("conid", ""), side,
+                   round(abs(num(x.get("shares"))), 6), round(num(x.get("price")), 6))
+            pool = flex_sig.get(sig, [])
+            match = next((t for t in pool if abs((dt - t).total_seconds()) <= 120), None)
+            if match is not None:
+                pool.remove(match)               # this Flex fill is used up
                 continue
             day = dt.astimezone(self.tz).date()
             if flex_last and day < flex_last:
@@ -520,14 +550,14 @@ class FlexData:
                 account=x.get("account", ""), conid=x.get("conid", ""), symbol=x.get("symbol", ""),
                 name=self.name_for(x.get("conid", ""), x.get("symbol", "")), asset=asset, currency=ccy,
                 fx=self.fx_for(ccy), multiplier=mult, raw_dt=x.get("time", ""), dt=dt, order_dt=None,
-                trade_date=day, side="SELL" if x.get("side", "").upper() in ("SLD", "SELL") else "BUY",
+                trade_date=day, side=side,
                 qty=qty, price=price, money=qty * price * mult,
                 comm_raw=-abs(num(x.get("commission"))),          # TWS: positive = paid; Flex: negative
                 comm_ccy=comm_ccy,
                 fifo_pnl=realized if realized is not None else 0.0,
                 exchange=x.get("exchange", ""), order_type=x.get("order_type", ""),
                 perm_id=str(x.get("perm_id") or ""), order_ref=x.get("order_ref", ""),
-                txn_id=f"TWS:{exec_id}", auto_fx=False, source="TWS", pnl_ccy=comm_ccy,
+                txn_id=f"TWS:{exec_id}", auto_fx=False, source="TWS", pnl_ccy=comm_ccy, exec_id=exec_id.strip(),
             ))
         if added:
             self.fills = sorted(self.fills + added, key=lambda f: (f.dt, f.txn_id))
@@ -904,7 +934,7 @@ def cycle_groups(data):
     for f in data.fills:
         if f.cycle is None:
             continue
-        key = (f.account, f.conid, f.cycle)
+        key = (canon(f.account), f.conid, f.cycle)
         if key not in groups:
             ref, _ = ref_key(f.account, f.conid, f.order_ref)
             groups[key] = ref or ("cycle",) + key
@@ -916,8 +946,54 @@ def assign_groups(orders, cyc_groups):
         key, o.is_entry = ref_key(o.account, o.conid, o.order_ref)
         if key is None and o.fills and o.fills[0].cycle is not None:
             # no bracket tag (manual / ActivityMonitor order): joins the position cycle it trades in
-            key = cyc_groups.get((o.account, o.conid, o.fills[0].cycle))
+            key = cyc_groups.get((canon(o.account), o.conid, o.fills[0].cycle))
         o.group = key or ("order", o.account, o.perm_id)
+
+
+def is_stop(order_type):
+    return (order_type or "").replace(" ", "").upper().startswith(("STP", "TRAIL"))
+
+
+def cached_stops(cache):
+    """group key -> [stop trigger, ...] for every stop order TWS has shown us (any status),
+    so SL % still works when the stop is pending or was filled / cancelled on another day."""
+    stops = defaultdict(list)
+    for pid, info in sorted(cache.items(), key=lambda kv: int(kv[0]) if kv[0].isdigit() else 0):
+        trig = trigger_of(info)
+        if trig is None or not is_stop(info.get("order_type")):
+            continue
+        key, is_entry = ref_key(info.get("account", ""), info.get("conid", ""), info.get("order_ref", ""))
+        if key is not None and not is_entry:
+            stops[key].append((pid, trig))
+    return stops
+
+
+def entry_price(o):
+    """Entry order price: its trigger, else its limit, else (Flex has no order prices for older
+    orders) the average fill price."""
+    if o.trigger is not None:
+        return o.trigger
+    if o.lmt is not None:
+        return o.lmt
+    qty = sum(f.qty for f in o.fills)
+    return sum(f.price * f.qty for f in o.fills) / qty if qty else None
+
+
+def fill_sl_pct(orders, stops_by_group, entry_by_group=None):
+    """SL % = |entry price - stop trigger| / entry price, where number_groups found no stop.
+    Entry orders use their group's stop; a stop whose entry is elsewhere uses entry_by_group."""
+    for o in orders:
+        if o.sl_pct is not None:
+            continue
+        if o.is_entry:
+            entry = entry_price(o)
+            stop = next((t for pid, t in stops_by_group.get(o.group, ()) if pid != o.perm_id), None)
+        elif entry_by_group and o.trigger is not None and is_stop(o.order_type):
+            entry, stop = entry_by_group.get(o.group), o.trigger
+        else:
+            continue
+        if entry and stop is not None:
+            o.sl_pct = abs(entry - stop) / entry
 
 
 def number_groups(orders):
@@ -939,8 +1015,7 @@ def number_groups(orders):
             for k, o in enumerate((o for o in live if o is not parent), 1):
                 o.sr = f"{n}.{k}"
             entry_price = parent.trigger if parent.trigger is not None else parent.lmt
-            stops = [o for o in g if o is not parent and o.trigger is not None
-                     and o.order_type.replace(" ", "").upper().startswith(("STP", "TRAIL"))]
+            stops = [o for o in g if o is not parent and o.trigger is not None and is_stop(o.order_type)]
             if entry_price and stops:
                 parent.sl_pct = abs(entry_price - stops[0].trigger) / entry_price
             result.append(parent)
@@ -983,8 +1058,8 @@ def open_positions(data, tws, day, live):
     by_contract = defaultdict(list)
     for f in data.fills:
         if not f.auto_fx and f.trade_date <= day:
-            by_contract[(f.account, f.conid)].append(f)
-    portfolio = tws.portfolio if (tws is not None and live) else {}
+            by_contract[(canon(f.account), f.conid)].append(f)
+    portfolio = {(canon(a), c): p for (a, c), p in tws.portfolio.items()} if (tws is not None and live) else {}
     rows = []
     for key, fills in by_contract.items():
         net = sum(f.signed for f in fills)
@@ -1119,7 +1194,7 @@ STAT_FORMATS = {10: FMT_AVG, 11: FMT_AVG, 12: FMT_MONEY, 13: FMT_MONEY, 15: FMT_
                 17: FMT_MONEY}
 
 
-def pending_orders(data, tws):
+def pending_orders(data, tws, stops_by_group=None, entry_by_group=None):
     if tws is None:
         return []
     orders = []
@@ -1141,7 +1216,9 @@ def pending_orders(data, tws):
         orders.append(o)
     # no placement time from TWS: keep permId order (sorting in number_groups is stable)
     orders.sort(key=lambda o: int(o.perm_id) if o.perm_id.isdigit() else 0)
-    return number_groups(orders)
+    orders = number_groups(orders)
+    fill_sl_pct(orders, stops_by_group or {}, entry_by_group)   # e.g. a stop whose entry already filled
+    return orders
 
 
 def build_report(data, cache, tws, d_from, d_to, out_path, include_live):
@@ -1151,6 +1228,15 @@ def build_report(data, cache, tws, d_from, d_to, out_path, include_live):
     orders = executed_orders(fills, cache) + tws_only_orders(data, cache, d_from, d_to)
     assign_groups(orders, cycle_groups(data))
     orders = number_groups(orders)
+    stops_by_group = cached_stops(cache)
+    fill_sl_pct(orders, stops_by_group)            # stop still pending, or filled on another day
+    entry_by_group = {}
+    for o in executed_orders([f for f in data.fills if f.trade_date <= d_to], cache):
+        key, o.is_entry = ref_key(o.account, o.conid, o.order_ref)
+        if key is not None and o.is_entry:
+            price = entry_price(o)
+            if price:
+                entry_by_group[key] = price
     order_of = {(o.account, o.perm_id): o for o in orders}
 
     positions = open_positions(data, tws, d_to, live)
@@ -1182,7 +1268,7 @@ def build_report(data, cache, tws, d_from, d_to, out_path, include_live):
         ("section", f"ALL TRADES SUMMARY ({data.base_ccy})"),
         ("Total Trades (fills)", len(fills), "0"),
         ("Orders Executed", len([o for o in orders if o.fills]), "0"),
-        ("Contracts Traded", len({(f.account, f.conid) for f in fills}), "0"),
+        ("Contracts Traded", len({(canon(f.account), f.conid) for f in fills}), "0"),
         ("Total Bought Value", sum(f.value for f in buys), FMT_MONEY),
         ("Total Sold Value", sum(f.value for f in sells), FMT_MONEY),
         ("Commission", sum(f.commission for f in fills), FMT_MONEY, "pnl"),
@@ -1210,7 +1296,7 @@ def build_report(data, cache, tws, d_from, d_to, out_path, include_live):
 
     # Pending Order (live from TWS)
     pend_rows = []
-    for o in (pending_orders(data, tws) if live else []):
+    for o in (pending_orders(data, tws, stops_by_group, entry_by_group) if live else []):
         pend_rows.append([o.sr, o.symbol, o.name, o.side, o.order_type, o.trigger, o.lmt, o.offset,
                           o.sl_pct, clean_num(o.qty), o.value])
     table_sheet(wb, "Pending Order", "PENDING ORDERS", PENDING_HEADERS, pend_rows,
@@ -1250,7 +1336,7 @@ def build_report(data, cache, tws, d_from, d_to, out_path, include_live):
     by_contract = {}
     for f in fills:
         if not f.auto_fx:
-            by_contract.setdefault((f.account, f.conid), []).append(f)
+            by_contract.setdefault((canon(f.account), f.conid), []).append(f)
     summary_rows = [stats_row(contract_stats(fs), open_keys.get(key, 0.0))
                     for key, fs in sorted(by_contract.items(), key=lambda kv: kv[1][0].dt)]
     table_sheet(wb, "Trade Summary", "TRADE SUMMARY", STAT_HEADERS, summary_rows, STAT_WIDTHS,
@@ -1265,6 +1351,23 @@ def build_report(data, cache, tws, d_from, d_to, out_path, include_live):
 # --------------------------------------------------------------------------- #
 # Main
 # --------------------------------------------------------------------------- #
+def replace_previous_total(out):
+    """The full-history file name carries its end date, so each day writes a new one. Delete the
+    one the previous default run wrote; reports made with --from / --to are never touched."""
+    prev = None
+    if LAST_TOTAL.exists():
+        prev = Path(LAST_TOTAL.read_text(encoding="utf-8").strip() or ".")
+    if prev and prev.name.startswith("GT_Report_") and prev.suffix == ".xlsx" \
+            and prev.resolve() != out.resolve() and prev.exists():
+        try:
+            prev.unlink()
+            print(f"  removed previous total report {prev.name}")
+        except OSError as e:
+            print(f"  !! could not remove old report {prev.name} ({e}) -- delete it by hand.")
+    LAST_TOTAL.parent.mkdir(parents=True, exist_ok=True)
+    LAST_TOTAL.write_text(str(out.resolve()), encoding="utf-8")
+
+
 def parse_day(text):
     try:
         return datetime.strptime(text, "%Y-%m-%d").date()
@@ -1341,6 +1444,8 @@ def main():
         print(f"{d_from:%d-%b-%Y} -> {d_to:%d-%b-%Y}: {s['fills']} fills, {s['orders']} orders, "
               f"{s['open']} open positions, commission {s['commission']:,.2f}, realized PnL {s['pnl']:,.2f}")
         print(f"  -> {out}")
+        if args.d_from is None and args.d_to is None:
+            replace_previous_total(out)
         if args.daily:
             days = sorted({f.trade_date for f in data.fills if d_from <= f.trade_date <= d_to})
             for day in days:
