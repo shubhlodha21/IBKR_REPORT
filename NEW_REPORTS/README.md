@@ -9,6 +9,7 @@ Builds one Excel workbook in the `FLEX_FORMATTING.xlsx` layout
 | FX pair realized PnL | Flex `FxTransactions` section (IBKR reports 0 on the trade itself) |
 | CFD financing charges | Flex `CFDCharges` section |
 | Pending orders, trigger / limit / offset / SL %, cancelled orders, unrealized PnL | TWS / IB Gateway (optional) |
+| Today's fills (after the last Flex day), with commission | TWS / IB Gateway executions (optional) |
 
 ## Run
 
@@ -35,7 +36,12 @@ Reports go to `reports/`; the raw Flex XML is kept in `reports/raw/`.
 
 ## Notes
 
-- Flex Activity data is end-of-day: the latest day included is IBKR's last completed day.
+- Flex Activity data is end-of-day: the latest day included is IBKR's last completed day. Fills after that
+  come live from IB Gateway (`reqExecutions`, with IBKR's commission) and are marked
+  `executed (TWS live, not yet in Flex)`. The next day Flex has them and they are replaced by the Flex
+  figures (matched by execution id, so nothing is counted twice). Gateway forgets executions after its
+  daily restart, so they are also kept in `data/tws_executions_cache.json` until Flex has them.
+- Gateway execution times are read in the time zone from `~/Jts/jts.ini` (`TimeZone=`), or `TWS_TIMEZONE` in `.env`.
 - The Flex query covers the last 365 days. Use `--from` for anything older; the script downloads it in 365-day chunks.
 - Flex has no order prices, so trigger, limit, offset and SL % come from TWS. TWS only remembers recent
   orders, so each run saves them in `data/tws_orders_cache.json`. Schedule a daily run on EC2 so the history builds up, e.g. with cron:

@@ -47,6 +47,8 @@ from openpyxl.utils import get_column_letter
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_OUT = SCRIPT_DIR / "reports"
 ORDER_CACHE = SCRIPT_DIR / "data" / "tws_orders_cache.json"
+EXEC_CACHE = SCRIPT_DIR / "data" / "tws_executions_cache.json"
+EXEC_CACHE_KEEP_DAYS = 10      # executions older than Flex data minus this are dropped from the cache
 
 FLEX_SEND_URL = "https://ndcdyn.interactivebrokers.com/AccountManagement/FlexWebService/SendRequest"
 FLEX_GET_URL = "https://ndcdyn.interactivebrokers.com/AccountManagement/FlexWebService/GetStatement"
@@ -314,6 +316,8 @@ class Fill:
     order_ref: str
     txn_id: str
     auto_fx: bool             # IBKR automatic conversion of a leftover cash balance
+    source: str = "FLEX"      # FLEX, or TWS for live fills Flex has not reported yet
+    pnl_ccy: str = ""         # currency of fifo_pnl when it is not the trade currency (TWS fills)
     value: float = 0.0        # base currency
     commission: float = 0.0   # base currency (negative = paid)
     pnl: float = 0.0          # base currency
@@ -335,6 +339,8 @@ class FlexData:
         self._fx_txns = {}
         self.cfd_charges = {}          # transactionID -> (account, date, amount base, description)
         self.flex_unrealized = {}      # (account, conid) -> (reportDate, unrealized base)
+        self.flex_exec_ids = set()     # ibExecID of every Flex fill (to skip TWS duplicates)
+        self.live_fills = 0            # TWS fills added because Flex does not have them yet
         for text in xml_texts:
             for st in ET.fromstring(text).iter("FlexStatement"):
                 self._load_statement(st)
@@ -374,6 +380,8 @@ class FlexData:
             f = self._fill(acct, e.attrib)
             if f:
                 self._fills[(f.account, f.txn_id or f"{f.raw_dt}|{f.conid}|{f.signed}")] = f
+                if e.get("ibExecID"):
+                    self.flex_exec_ids.add(e.get("ibExecID").strip())
 
         for e in st.iter("FxTransaction"):
             a = e.attrib
@@ -455,8 +463,10 @@ class FlexData:
                 f.commission = f.comm_raw * f.fx
             else:
                 f.commission = f.comm_raw * self.fx_for(f.comm_ccy)
-            if f.asset == "CASH":
+            if f.asset == "CASH" and f.source == "FLEX":
                 cash_groups[(f.account, f.raw_dt, f.symbol)].append(f)
+            elif f.pnl_ccy and f.pnl_ccy != f.currency:
+                f.pnl = f.fifo_pnl * self.fx_for(f.pnl_ccy)
             else:
                 f.pnl = f.fifo_pnl * f.fx
 
@@ -480,6 +490,50 @@ class FlexData:
             net[key] += f.signed
             if abs(net[key]) < 1e-9:
                 net[key] = 0.0
+
+    def add_live_fills(self, executions, tws_tz):
+        """Add TWS executions that Flex has not reported yet (Flex is end-of-day, so today's
+        fills -- and any after the last Flex statement -- only exist in TWS / IB Gateway).
+        A fill is skipped when Flex already has its execution id, or it is older than the Flex data."""
+        added = []
+        flex_last = self.to_date
+        flex_last_dt = self.fills[-1].dt if self.fills else None
+        for exec_id, x in executions.items():
+            if exec_id in self.flex_exec_ids:
+                continue
+            dt = parse_tws_time(x.get("time", ""), tws_tz)
+            if dt is None:
+                continue
+            day = dt.astimezone(self.tz).date()
+            if flex_last and day < flex_last:
+                continue
+            if not self.flex_exec_ids and flex_last_dt and dt <= flex_last_dt:
+                continue                         # Flex query without ibExecID: trust Flex up to its last fill
+            qty = abs(num(x.get("shares")))
+            price = num(x.get("price"))
+            mult = num(x.get("multiplier")) or 1.0
+            asset = x.get("sec_type", "")
+            ccy = x.get("currency", "")
+            comm_ccy = x.get("comm_ccy") or ccy
+            realized = x.get("realized")
+            added.append(Fill(
+                account=x.get("account", ""), conid=x.get("conid", ""), symbol=x.get("symbol", ""),
+                name=self.name_for(x.get("conid", ""), x.get("symbol", "")), asset=asset, currency=ccy,
+                fx=self.fx_for(ccy), multiplier=mult, raw_dt=x.get("time", ""), dt=dt, order_dt=None,
+                trade_date=day, side="SELL" if x.get("side", "").upper() in ("SLD", "SELL") else "BUY",
+                qty=qty, price=price, money=qty * price * mult,
+                comm_raw=-abs(num(x.get("commission"))),          # TWS: positive = paid; Flex: negative
+                comm_ccy=comm_ccy,
+                fifo_pnl=realized if realized is not None else 0.0,
+                exchange=x.get("exchange", ""), order_type=x.get("order_type", ""),
+                perm_id=str(x.get("perm_id") or ""), order_ref=x.get("order_ref", ""),
+                txn_id=f"TWS:{exec_id}", auto_fx=False, source="TWS", pnl_ccy=comm_ccy,
+            ))
+        if added:
+            self.fills = sorted(self.fills + added, key=lambda f: (f.dt, f.txn_id))
+            self.live_fills = len(added)
+            self._finalize()
+        return len(added)
 
     def fx_for(self, ccy):
         """Latest Flex rate ccy -> base."""
@@ -542,6 +596,8 @@ def fetch_tws(host, port, client_id, wait):
             self.open_orders = {}
             self.completed_orders = {}
             self.portfolio = {}
+            self.exec_done = threading.Event()
+            self.executions = {}           # execId -> execution + commission report
 
         def error(self, reqId, *args):
             # (code, msg[, json]) in older APIs, (time, code, msg, json) from API 10.33
@@ -571,6 +627,37 @@ def fetch_tws(host, port, client_id, wait):
 
         def completedOrdersEnd(self):
             self.completed_done.set()
+
+        def execDetails(self, reqId, contract, execution):
+            is_cash = contract.secType == "CASH"
+            d = self.executions.setdefault(execution.execId, {})
+            d.update({
+                "exec_id": execution.execId,
+                "time": execution.time,
+                "account": execution.acctNumber,
+                "conid": str(contract.conId),
+                "symbol": contract.localSymbol if is_cash and contract.localSymbol else contract.symbol,
+                "sec_type": contract.secType,
+                "currency": contract.currency,
+                "multiplier": num(contract.multiplier) or 1.0,
+                "side": execution.side,
+                "shares": float(execution.shares),
+                "price": float(execution.price),
+                "exchange": execution.exchange,
+                "perm_id": str(execution.permId),
+                "order_ref": execution.orderRef or "",
+            })
+
+        def execDetailsEnd(self, reqId):
+            self.exec_done.set()
+
+        def commissionReport(self, report):           # ibapi 9.x / 10.x
+            d = self.executions.setdefault(report.execId, {})
+            realized = float(report.realizedPNL)
+            d.update({"commission": float(report.commission), "comm_ccy": report.currency,
+                      "realized": None if abs(realized) >= 1e300 else realized})
+
+        commissionAndFeesReport = commissionReport     # renamed in newer ibapi
 
         def updatePortfolio(self, contract, position, marketPrice, marketValue, averageCost,
                             unrealizedPNL, realizedPNL, accountName):
@@ -606,6 +693,10 @@ def fetch_tws(host, port, client_id, wait):
         app.open_done.wait(wait)
         app.reqCompletedOrders(False)
         app.completed_done.wait(wait)
+        from ibapi.execution import ExecutionFilter
+        app.reqExecutions(9001, ExecutionFilter())     # today's fills (Flex only has up to yesterday)
+        app.exec_done.wait(wait)
+        time.sleep(1.0)                                 # commission reports follow the executions
         for acct in app.accounts:
             app.account_done.clear()
             app.reqAccountUpdates(True, acct)
@@ -614,7 +705,8 @@ def fetch_tws(host, port, client_id, wait):
     finally:
         app.disconnect()
     print(f"  TWS: {len(app.open_orders)} open orders, {len(app.completed_orders)} completed orders, "
-          f"{len(app.portfolio)} positions (accounts {', '.join(app.accounts) or '-'})")
+          f"{len(app.executions)} recent executions, {len(app.portfolio)} positions "
+          f"(accounts {', '.join(app.accounts) or '-'})")
     return app
 
 
@@ -637,6 +729,61 @@ def update_order_cache(tws, path):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(cache, indent=1, sort_keys=True), encoding="utf-8")
     return cache
+
+
+def update_exec_cache(tws, path):
+    """IB Gateway forgets executions after its daily restart, so every run stores them here
+    until Flex has them. Only fills that are complete (have a commission report) are kept."""
+    cache = {}
+    if path.exists():
+        try:
+            cache = json.loads(path.read_text(encoding="utf-8"))
+        except ValueError:
+            print(f"  !! {path.name} is unreadable -- starting a new execution cache.")
+    if tws is None:
+        return cache
+    for exec_id, d in tws.executions.items():
+        if d.get("time") and "commission" in d:
+            cache[exec_id] = d
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(cache, indent=1, sort_keys=True), encoding="utf-8")
+    return cache
+
+
+def prune_exec_cache(cache, data, tws_tz, path):
+    """Drop cached executions Flex already has or that are well before the Flex data."""
+    if not cache or data.to_date is None:
+        return
+    keep_from = data.to_date - timedelta(days=EXEC_CACHE_KEEP_DAYS)
+    stale = []
+    for exec_id, d in cache.items():
+        dt = parse_tws_time(d.get("time", ""), tws_tz)
+        if exec_id in data.flex_exec_ids or dt is None or dt.astimezone(data.tz).date() < keep_from:
+            stale.append(exec_id)
+    if stale:
+        for k in stale:
+            del cache[k]
+        path.write_text(json.dumps(cache, indent=1, sort_keys=True), encoding="utf-8")
+
+
+def tws_timezone():
+    """Time zone IB Gateway / TWS writes execution times in: TWS_TIMEZONE, else the TimeZone=
+    line of jts.ini (JTS_INI, default ~/Jts/jts.ini), else UTC."""
+    name = setting("TWS_TIMEZONE")
+    if not name:
+        ini = Path(setting("JTS_INI") or Path.home() / "Jts" / "jts.ini").expanduser()
+        try:
+            for line in ini.read_text(encoding="utf-8", errors="ignore").splitlines():
+                if line.strip().lower().startswith("timezone="):
+                    name = line.split("=", 1)[1].strip()
+                    break
+        except OSError:
+            pass
+    try:
+        return ZoneInfo(name) if name else timezone.utc
+    except Exception:
+        print(f"  !! Unknown TWS time zone {name!r} -- using UTC.")
+        return timezone.utc
 
 
 # --------------------------------------------------------------------------- #
@@ -703,12 +850,18 @@ def executed_orders(fills, cache):
     for (acct, pid), fs in by_order.items():
         f0 = fs[0]
         info = cache.get(pid, {})
+        if f0.auto_fx:
+            status = "executed (IBKR auto FX conversion)"
+        elif all(f.source == "TWS" for f in fs):
+            status = "executed (TWS live, not yet in Flex)"
+        else:
+            status = "executed"
         orders.append(Order(
             account=acct, perm_id=pid, conid=f0.conid, symbol=f0.symbol, name=f0.name, side=f0.side,
-            order_type=f0.order_type or ("AUTO-FX" if f0.auto_fx else ""),
+            order_type=f0.order_type or info.get("order_type") or ("AUTO-FX" if f0.auto_fx else ""),
             qty=sum(f.qty for f in fs), value=sum(f.value for f in fs),
             placed=f0.order_dt, done=fs[-1].dt, order_ref=f0.order_ref, fills=fs,
-            status="executed (IBKR auto FX conversion)" if f0.auto_fx else "executed",
+            status=status,
             trigger=trigger_of(info), lmt=info.get("lmt"), numbered=not f0.auto_fx,
         ))
     return orders
@@ -1024,6 +1177,7 @@ def build_report(data, cache, tws, d_from, d_to, out_path, include_live):
         ("IBKR Flex Data Through", f"{data.to_date:%d-%b-%Y}" if data.to_date else "", None),
         ("Generated (GST)", datetime.now(TZ_GST).replace(tzinfo=None, microsecond=0), None),
         ("TWS Live Data", "connected" if live else "not used", None),
+        ("Live Fills from TWS (not in Flex yet)", sum(1 for f in fills if f.source == "TWS"), "0"),
         None,
         ("section", f"ALL TRADES SUMMARY ({data.base_ccy})"),
         ("Total Trades (fills)", len(fills), "0"),
@@ -1049,7 +1203,9 @@ def build_report(data, cache, tws, d_from, d_to, out_path, include_live):
             rows.append((f"{acct}  Commission", sum(f.commission for f in af), FMT_MONEY, "pnl"))
             rows.append((f"{acct}  Realized PnL", sum(f.pnl for f in af), FMT_MONEY, "pnl"))
     rows += [None, ("note", "Commission and Realized PnL are IBKR's own figures per fill (FIFO; realized "
-                            "PnL is already net of commissions). Negative commission = paid.")]
+                            "PnL is already net of commissions). Negative commission = paid. Fills after "
+                            "the Flex date come live from TWS / IB Gateway and are replaced by Flex the "
+                            "next day.")]
     dashboard_sheet(wb, rows)
 
     # Pending Order (live from TWS)
@@ -1163,6 +1319,12 @@ def main():
         tws = fetch_tws(setting("TWS_HOST", "127.0.0.1"), int(setting_num("TWS_PORT", 4001)),
                         int(setting_num("TWS_CLIENT_ID", 997)), setting_num("TWS_WAIT_SECONDS", 8))
     cache = update_order_cache(tws, ORDER_CACHE)
+    tws_tz = tws_timezone()
+    exec_cache = update_exec_cache(tws, EXEC_CACHE)
+    prune_exec_cache(exec_cache, data, tws_tz, EXEC_CACHE)
+    if exec_cache:
+        added = data.add_live_fills(exec_cache, tws_tz)
+        print(f"  {added} live fill(s) from TWS added (after Flex data {data.to_date}; TWS time zone {tws_tz})")
 
     first_fill = data.fills[0].trade_date if data.fills else data.from_date or date.today()
     last_day = max([d for d in (data.to_date, data.fills[-1].trade_date if data.fills else None) if d],

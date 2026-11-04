@@ -2,3 +2,5 @@
 reports/
 # TWS order cache (trigger / limit / status history)
 data/
+# Local EC2 fetch script (holds your EC2 IP and key path)
+fetch_ec2_reports.bat

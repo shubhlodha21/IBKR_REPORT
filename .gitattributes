@@ -8,3 +8,6 @@
 *.py    text eol=lf
 *.txt   text eol=lf
 *.md    text eol=lf
+
+# Windows batch files use CRLF
+*.bat   text eol=crlf
